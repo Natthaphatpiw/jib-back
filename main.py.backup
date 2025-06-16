@@ -1,0 +1,547 @@
+import json
+import os
+from typing import List, Optional, Literal
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+import openai
+import google.generativeai as genai
+import re
+from pymongo import MongoClient
+
+load_dotenv()
+
+app = FastAPI(title="JIB Computer Shop AI Search API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class Product(BaseModel):
+    id: int
+    ชื่อสินค้า: str
+    หมวดหมู่: str
+    รูปสินค้า: str
+    คำอธิบายสินค้า: str
+    ราคาเดิม: str
+    ราคาปัจจุบัน: str
+    ส่วนลด: str
+    views: str
+    
+    model_config = {"populate_by_name": True}
+
+class SearchRequest(BaseModel):
+    query: str
+    llm_provider: Literal["gemini", "openai"] = "gemini"
+
+class SearchResponse(BaseModel):
+    products: List[dict]
+    suggestions: List[str]
+    ranking_explanation: str
+
+class SuggestionsRequest(BaseModel):
+    partial_query: str
+
+class SuggestionsResponse(BaseModel):
+    suggestions: List[str]
+
+# MongoDB connection setup
+def get_mongodb_connection():
+    """Setup MongoDB connection"""
+    try:
+        mongodb_uri = "mongodb+srv://natthaphattoichatturat:0831099362p@cluster0.rsdqqr7.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+        client = MongoClient(mongodb_uri)
+        db = client.shopdb
+        return db
+    except Exception as e:
+        print(f"MongoDB connection error: {e}")
+        return None
+
+# Load product data from MongoDB
+def load_products():
+    try:
+        db = get_mongodb_connection()
+        if db is None:
+            print("Failed to connect to MongoDB")
+            return []
+        
+        collection = db.jib_chatbot
+        products = list(collection.find({}))
+        
+        # Convert MongoDB documents to the expected format
+        for product in products:
+            if '_id' in product:
+                product['id'] = str(product['_id'])
+                del product['_id']
+        
+        print(f"✅ Loaded {len(products)} products from MongoDB")
+        return products
+    except Exception as e:
+        print(f"Error loading products from MongoDB: {e}")
+        return []
+
+products_data = load_products()
+
+# Initialize AI clients
+openai.api_key = os.getenv("OPENAI_API_KEY")
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+
+def extract_price_from_string(price_str: str) -> float:
+    """Extract numeric price from Thai price string"""
+    price_numbers = re.findall(r'[\d,]+', price_str.replace(',', ''))
+    return float(price_numbers[0]) if price_numbers else 0
+
+def stage1_analyze_query(query: str, provider: str) -> dict:
+    """Stage 1 LLM: Analyze user query and create MongoDB filter criteria"""
+    prompt = f"""
+    You are Stage 1 LLM for a Thai computer shop search system. Analyze the user query and create precise MongoDB filter criteria.
+    
+    User Query: "{query}"
+    
+    ANALYSIS RULES:
+    1. Product Categories:
+       - โน้ตบุ๊ค/notebook → "หมวดหมู่": "NOTEBOOK"
+       - คอม/desktop/คอมพิวเตอร์ → "หมวดหมู่": "DESKTOP" 
+       - จอ/monitor/มอนิเตอร์ → "หมวดหมู่": "MONITOR"
+       - CPU/ซีพียู → "หมวดหมู่": "CPU"
+       - VGA/การ์ดจอ → "หมวดหมู่": "VGA"
+       
+    2. Price Analysis:
+       - งบ X / ราคา X / ไม่เกิน X → price_max: X
+       - ราคา X-Y → price_min: X, price_max: Y
+       - Price extraction from "ราคาปัจจุบัน" field (format: "12,990.-")
+       
+    3. Brand Detection:
+       - Extract brands: ASUS, HP, DELL, LENOVO, MSI, ACER, AMD, INTEL
+       
+    4. Performance Keywords:
+       - แรงๆ/gaming/เกม → performance_level: "gaming"
+       - ทำงาน/office → performance_level: "office"
+       
+    5. MongoDB Query Generation:
+       - Create exact MongoDB filter query
+       - Use $lte for price_max, $gte for price_min
+       - Use $regex for text searches (case-insensitive)
+    
+    EXAMPLES:
+    Query: "โน้ตบุ๊คแรงๆ งบ 25000"
+    → {{"category": "NOTEBOOK", "price_max": 25000, "performance_level": "gaming", "mongodb_filter": {{"หมวดหมู่": "NOTEBOOK"}}}}
+    
+    Query: "ASUS notebook ราคา 15000-20000"  
+    → {{"category": "NOTEBOOK", "brands": ["ASUS"], "price_min": 15000, "price_max": 20000, "mongodb_filter": {{"หมวดหมู่": "NOTEBOOK", "ชื่อสินค้า": {{"$regex": "ASUS", "$options": "i"}}}}}}
+    
+    Return ONLY valid JSON with mongodb_filter field:
+    {{
+        "category": "string or null",
+        "price_min": "number or null", 
+        "price_max": "number or null",
+        "brands": ["array of strings"],
+        "keywords": ["array of strings"],
+        "performance_level": "string or null",
+        "mongodb_filter": {{
+            "หมวดหมู่": "category_if_specified",
+            "additional_filters": "as_needed"
+        }}
+    }}
+    """
+    
+    try:
+        print(f"🎯 Stage 1 LLM: Analyzing query with {provider}")
+        
+        if provider == "openai":
+            api_key = os.getenv("OPENAI_API_KEY")
+            if not api_key:
+                return fallback_analysis(query)
+                
+            client = openai.OpenAI(api_key=api_key)
+            response = client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1
+            )
+            result = response.choices[0].message.content
+            
+        else:  # gemini
+            api_key = os.getenv("GEMINI_API_KEY")
+            if not api_key:
+                return fallback_analysis(query)
+                
+            model = genai.GenerativeModel('gemini-1.5-flash')
+            response = model.generate_content(prompt)
+            result = response.text
+        
+        # Extract and parse JSON
+        json_match = re.search(r'\{.*\}', result, re.DOTALL)
+        if json_match:
+            analysis = json.loads(json_match.group())
+            print(f"✅ Stage 1 Analysis: {analysis}")
+            return analysis
+        else:
+            return fallback_analysis(query)
+            
+    except Exception as e:
+        print(f"❌ Stage 1 LLM Error: {e}")
+        return fallback_analysis(query)
+
+def stage2_rank_products(query: str, products: List[dict], stage1_analysis: dict, provider: str) -> List[dict]:
+    """Stage 2 LLM: Analyze products and rank them based on user needs"""
+    
+    # Limit products for LLM analysis (top 50 to avoid token limits)
+    limited_products = products[:50] if len(products) > 50 else products
+    
+    # Create simplified product data for LLM
+    simplified_products = []
+    for i, product in enumerate(limited_products):
+        simplified_products.append({
+            "index": i,
+            "ชื่อสินค้า": product["ชื่อสินค้า"],
+            "หมวดหมู่": product["หมวดหมู่"], 
+            "ราคาปัจจุบัน": product["ราคาปัจจุบัน"],
+            "คำอธิบายสินค้า": product["คำอธิบายสินค้า"][:200] + "...",
+            "ส่วนลด": product["ส่วนลด"],
+            "views": product["views"]
+        })
+    
+    prompt = f"""
+    You are Stage 2 LLM for product ranking. Analyze user needs and rank products accordingly.
+    
+    User Query: "{query}"
+    Stage 1 Analysis: {json.dumps(stage1_analysis, ensure_ascii=False)}
+    
+    Products to analyze: {json.dumps(simplified_products, ensure_ascii=False)}
+    
+    RANKING CRITERIA:
+    1. Exact Match: Product name/description matches user query exactly
+    2. Price Fit: Products within user's budget get higher priority
+    3. Performance Match: Gaming products for gaming queries, office products for work
+    4. Brand Preference: Mentioned brands get priority
+    5. Value: Better price/performance ratio
+    6. Discount: Products with discounts get slight boost
+    7. Popularity: Higher view count indicates popularity
+    
+    ANALYSIS FOCUS:
+    - For "แรงๆ/gaming": Look for RTX, GTX, gaming keywords, high-end specs
+    - For "ทำงาน/office": Look for basic specs, good value, reliability
+    - For budget queries: Strict price filtering, best value within budget
+    - For brand queries: Prioritize specific brands mentioned
+    
+    Return JSON with ranked product indices and explanations:
+    {{
+        "ranked_products": [
+            {{
+                "index": 0,
+                "score": 95,
+                "reason": "Perfect match - gaming notebook within budget with RTX graphics"
+            }},
+            {{
+                "index": 2, 
+                "score": 85,
+                "reason": "Good alternative - slightly over budget but better specs"
+            }}
+        ],
+        "ranking_explanation": "Found X products matching your criteria. Ranked by gaming performance and budget fit."
+    }}
+    
+    Return top 20 products maximum, ranked by relevance score.
+    """
+    
+    try:
+        print(f"🎯 Stage 2 LLM: Ranking {len(limited_products)} products with {provider}")
+        
+        if provider == "openai":
+            api_key = os.getenv("OPENAI_API_KEY")
+            if not api_key:
+                return products[:20]  # Fallback to first 20
+                
+            client = openai.OpenAI(api_key=api_key)
+            response = client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2
+            )
+            result = response.choices[0].message.content
+            
+        else:  # gemini
+            api_key = os.getenv("GEMINI_API_KEY")
+            if not api_key:
+                return products[:20]
+                
+            model = genai.GenerativeModel('gemini-1.5-flash')
+            response = model.generate_content(prompt)
+            result = response.text
+        
+        # Parse LLM response
+        json_match = re.search(r'\{.*\}', result, re.DOTALL)
+        if json_match:
+            ranking_result = json.loads(json_match.group())
+            
+            # Reconstruct ranked products based on LLM analysis
+            ranked_products = []
+            for item in ranking_result.get("ranked_products", []):
+                index = item.get("index")
+                if index < len(limited_products):
+                    ranked_products.append(limited_products[index])
+            
+            print(f"✅ Stage 2 Ranking: {len(ranked_products)} products ranked")
+            return ranked_products[:20]  # Return top 20
+            
+        else:
+            print("⚠️ Stage 2: No valid JSON response, using original order")
+            return products[:20]
+            
+    except Exception as e:
+        print(f"❌ Stage 2 LLM Error: {e}")
+        return products[:20]
+
+def fallback_analysis(query: str) -> dict:
+    """Fallback analysis when AI fails"""
+    print(f"🔧 Using fallback analysis for query: {query}")
+    analysis = {
+        "category": None,
+        "price_min": None,
+        "price_max": None,
+        "keywords": [],
+        "brands": [],
+        "performance_level": None
+    }
+    
+    query_lower = query.lower()
+    
+    # Category detection
+    if any(word in query_lower for word in ['โน้ตบุ๊ค', 'notebook']):
+        analysis["category"] = "NOTEBOOK"
+    elif any(word in query_lower for word in ['desktop', 'คอม', 'คอมพิวเตอร์']):
+        analysis["category"] = "DESKTOP"
+    elif any(word in query_lower for word in ['monitor', 'จอ', 'จอมอนิเตอร์']):
+        analysis["category"] = "MONITOR"
+    
+    # Price extraction with better regex
+    price_patterns = [
+        r'งบ\s*(\d+)',  # งบ 25000
+        r'ราคา\s*(\d+)',  # ราคา 25000
+        r'ไม่เกิน\s*(\d+)',  # ไม่เกิน 25000
+        r'(\d{4,6})\s*บาท',  # 25000 บาท (4-6 digits)
+        r'(\d{4,6})',  # Any 4-6 digit number (likely price)
+    ]
+    
+    for pattern in price_patterns:
+        match = re.search(pattern, query)
+        if match:
+            price_str = match.group(1).replace(',', '')
+            analysis["price_max"] = int(price_str)
+            break
+    
+    # Performance level
+    if any(word in query_lower for word in ['แรงๆ', 'แรง', 'gaming', 'เกม']):
+        analysis["performance_level"] = "gaming"
+    elif any(word in query_lower for word in ['ทำงาน', 'office', 'ออฟฟิศ']):
+        analysis["performance_level"] = "entry"
+    
+    # Brand detection
+    brands = ['asus', 'acer', 'hp', 'dell', 'lenovo', 'msi']
+    for brand in brands:
+        if brand in query_lower:
+            analysis["brands"].append(brand.upper())
+    
+    print(f"🎯 Fallback analysis result: {analysis}")
+    return analysis
+
+def enhance_analysis_with_fallback(query: str, ai_analysis: dict) -> dict:
+    """Enhance AI analysis with fallback logic"""
+    fallback = fallback_analysis(query)
+    
+    # Use fallback values if AI didn't detect them
+    if not ai_analysis.get("price_max") and fallback.get("price_max"):
+        ai_analysis["price_max"] = fallback["price_max"]
+    
+    if not ai_analysis.get("category") and fallback.get("category"):
+        ai_analysis["category"] = fallback["category"]
+    
+    if not ai_analysis.get("performance_level") and fallback.get("performance_level"):
+        ai_analysis["performance_level"] = fallback["performance_level"]
+    
+    return ai_analysis
+
+def query_mongodb_with_filters(stage1_analysis: dict) -> List[dict]:
+    """Query MongoDB using Stage 1 LLM analysis"""
+    try:
+        db = get_mongodb_connection()
+        if db is None:
+            return []
+        
+        collection = db.jib_chatbot
+        
+        # Build MongoDB query from Stage 1 analysis
+        mongo_query = {}
+        
+        # Category filter
+        if stage1_analysis.get('category'):
+            mongo_query['หมวดหมู่'] = stage1_analysis['category']
+        
+        # Brand filter
+        if stage1_analysis.get('brands'):
+            brand_regex = '|'.join(stage1_analysis['brands'])
+            mongo_query['ชื่อสินค้า'] = {'$regex': brand_regex, '$options': 'i'}
+        
+        # Additional filters from mongodb_filter field
+        if stage1_analysis.get('mongodb_filter'):
+            mongo_query.update(stage1_analysis['mongodb_filter'])
+        
+        print(f"🔍 MongoDB Query: {mongo_query}")
+        
+        # Execute query
+        cursor = collection.find(mongo_query)
+        products = list(cursor)
+        
+        # Convert MongoDB documents
+        for product in products:
+            if '_id' in product:
+                product['id'] = str(product['_id'])
+                del product['_id']
+        
+        # Apply price filtering (post-query since MongoDB price format is complex)
+        filtered_products = []
+        for product in products:
+            current_price = extract_price_from_string(product['ราคาปัจจุบัน'])
+            
+            # Price range filtering
+            if stage1_analysis.get('price_max') and current_price > stage1_analysis['price_max']:
+                continue
+            if stage1_analysis.get('price_min') and current_price < stage1_analysis['price_min']:
+                continue
+                
+            filtered_products.append(product)
+        
+        print(f"📊 Found {len(filtered_products)} products after filtering")
+        return filtered_products
+        
+    except Exception as e:
+        print(f"❌ MongoDB query error: {e}")
+        return []
+
+def generate_suggestions(partial_query: str) -> List[str]:
+    """Generate search suggestions based on partial query"""
+    suggestions = []
+    partial_lower = partial_query.lower()
+    
+    # Common search patterns
+    common_searches = [
+        "โน้ตบุ๊คสำหรับเกม",
+        "โน้ตบุ๊คทำงาน",
+        "คอมพิวเตอร์ประกอบ",
+        "การ์ดจอ RTX",
+        "เมาส์เกมมิ่ง",
+        "คีย์บอร์ดไฟ",
+        "หูฟังเกม",
+        "จอมอนิเตอร์ 4K",
+        "SSD 1TB",
+        "RAM 16GB"
+    ]
+    
+    # Filter suggestions based on partial query
+    for suggestion in common_searches:
+        if partial_lower in suggestion.lower() or suggestion.lower().startswith(partial_lower):
+            suggestions.append(suggestion)
+    
+    # Add category-based suggestions
+    categories = ["NOTEBOOK", "DESKTOP", "MONITOR", "KEYBOARD", "MOUSE"]
+    for category in categories:
+        if partial_lower in category.lower():
+            suggestions.append(f"{category} แนะนำ")
+    
+    return suggestions[:5]
+
+@app.post("/api/search", response_model=SearchResponse)
+async def search_products(request: SearchRequest):
+    try:
+        print(f"🔍 Two-Stage LLM Search for query: {request.query}")
+        
+        # Stage 1: Analyze query and create MongoDB filters
+        stage1_analysis = stage1_analyze_query(request.query, request.llm_provider)
+        
+        # Query MongoDB with Stage 1 filters
+        filtered_products = query_mongodb_with_filters(stage1_analysis)
+        
+        if not filtered_products:
+            return SearchResponse(
+                products=[],
+                suggestions=generate_suggestions(request.query),
+                ranking_explanation="ไม่พบสินค้าที่ตรงตามเงื่อนไขการค้นหา"
+            )
+        
+        # Stage 2: Intelligent product ranking
+        ranked_products = stage2_rank_products(
+            request.query, 
+            filtered_products, 
+            stage1_analysis, 
+            request.llm_provider
+        )
+        
+        # Generate suggestions
+        suggestions = generate_suggestions(request.query)
+        
+        # Create detailed ranking explanation
+        ranking_explanation = f"🎯 Two-Stage LLM Analysis: พบสินค้า {len(ranked_products)} รายการ"
+        
+        filters_applied = []
+        if stage1_analysis.get('category'):
+            filters_applied.append(f"หมวดหมู่: {stage1_analysis['category']}")
+        
+        if stage1_analysis.get('price_max'):
+            filters_applied.append(f"ราคาไม่เกิน: {stage1_analysis['price_max']:,} บาท")
+        elif stage1_analysis.get('price_min'):
+            filters_applied.append(f"ราคาขั้นต่ำ: {stage1_analysis['price_min']:,} บาท")
+            
+        if stage1_analysis.get('performance_level'):
+            performance_text = {
+                'gaming': 'สำหรับเล่นเกม',
+                'office': 'สำหรับทำงาน', 
+                'high': 'ประสิทธิภาพสูง'
+            }
+            filters_applied.append(f"ประเภท: {performance_text.get(stage1_analysis['performance_level'], stage1_analysis['performance_level'])}")
+            
+        if stage1_analysis.get('brands'):
+            filters_applied.append(f"ยี่ห้อ: {', '.join(stage1_analysis['brands'])}")
+            
+        if filters_applied:
+            ranking_explanation += f" | เงื่อนไข: {' | '.join(filters_applied)}"
+        
+        ranking_explanation += f" | จัดเรียงโดย AI ตามความเหมาะสม"
+        
+        return SearchResponse(
+            products=ranked_products,
+            suggestions=suggestions,
+            ranking_explanation=ranking_explanation
+        )
+    
+    except Exception as e:
+        print(f"❌ Search error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/suggestions", response_model=SuggestionsResponse)
+async def get_suggestions(partial_query: str):
+    try:
+        suggestions = generate_suggestions(partial_query)
+        return SuggestionsResponse(suggestions=suggestions)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/")
+async def root():
+    return {"message": "JIB Computer Shop AI Search API", "status": "running"}
+
+# MongoDB utility functions
+def refresh_products_data():
+    """Refresh products data from MongoDB"""
+    global products_data
+    products_data = load_products()
+    return len(products_data)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
